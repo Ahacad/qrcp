@@ -2,16 +2,22 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"image/jpeg"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/claudiodangelis/qrcp/qr"
 
 	"github.com/claudiodangelis/qrcp/config"
 	"github.com/claudiodangelis/qrcp/pages"
@@ -22,6 +28,7 @@ import (
 
 // Server is the server
 type Server struct {
+	BaseURL string
 	// SendURL is the URL used to send the file
 	SendURL string
 	// ReceiveURL is the URL used to Receive the file
@@ -42,7 +49,11 @@ func (s *Server) ReceiveTo(dir string) error {
 		return err
 	}
 	// Check if the output dir exists
-	if dir, _ := os.Stat(output); !dir.IsDir() {
+	fileinfo, err := os.Stat(output)
+	if err != nil {
+		return err
+	}
+	if !fileinfo.IsDir() {
 		return fmt.Errorf("%s is not a valid directory", output)
 	}
 	s.outputDir = output
@@ -53,6 +64,17 @@ func (s *Server) ReceiveTo(dir string) error {
 func (s *Server) Send(p payload.Payload) {
 	s.payload = p
 	s.expectParallelRequests = true
+}
+
+// DisplayQR creates a handler for serving the QR code in the browser
+func (s *Server) DisplayQR(url string) {
+	const PATH = "/qr"
+	qrImg := qr.RenderImage(url)
+	http.HandleFunc(PATH, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		jpeg.Encode(w, qrImg, nil)
+	})
+	openBrowser(s.BaseURL + PATH)
 }
 
 // Wait for transfer to be completed, it waits forever if kept awlive
@@ -104,13 +126,32 @@ func New(cfg *config.Config) (*Server, error) {
 	if cfg.FQDN != "" {
 		hostname = fmt.Sprintf("%s:%d", cfg.FQDN, port)
 	}
-	// Set send and receive URLs
-	app.SendURL = fmt.Sprintf("http://%s/send/%s",
-		hostname, path)
-	app.ReceiveURL = fmt.Sprintf("http://%s/receive/%s",
-		hostname, path)
+	// Set URLs
+	protocol := "http"
+	if cfg.Secure {
+		protocol = "https"
+	}
+	app.BaseURL = fmt.Sprintf("%s://%s", protocol, hostname)
+	app.SendURL = fmt.Sprintf("%s/send/%s",
+		app.BaseURL, path)
+	app.ReceiveURL = fmt.Sprintf("%s/receive/%s",
+		app.BaseURL, path)
 	// Create a server
-	httpserver := &http.Server{Addr: host}
+	httpserver := &http.Server{
+		Addr: host,
+		TLSConfig: &tls.Config{
+			MinVersion:               tls.VersionTLS12,
+			CurvePreferences:         []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
+			PreferServerCipherSuites: true,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+			},
+		},
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler), 0),
+	}
 	// Create channel to send message to stop server
 	app.stopChannel = make(chan bool)
 	// Create cookie used to verify request is coming from first client to connect
@@ -131,36 +172,34 @@ func New(cfg *config.Config) (*Server, error) {
 	// Create handlers
 	// Send handler (sends file to caller)
 	http.HandleFunc("/send/"+path, func(w http.ResponseWriter, r *http.Request) {
-		if cookie.Value == "" {
-			if !strings.HasPrefix(r.Header.Get("User-Agent"), "Mozilla") {
-				http.Error(w, "", http.StatusOK)
-				return
-			}
-			initCookie.Do(func() {
-				value, err := util.GetSessionID()
-				if err != nil {
-					log.Println("Unable to generate session ID", err)
-					app.stopChannel <- true
+		if strings.HasPrefix(r.Header.Get("User-Agent"), "Mozilla") {
+			if cookie.Value == "" {
+				initCookie.Do(func() {
+					value, err := util.GetSessionID()
+					if err != nil {
+						log.Println("Unable to generate session ID", err)
+						app.stopChannel <- true
+						return
+					}
+					cookie.Value = value
+					http.SetCookie(w, &cookie)
+				})
+			} else {
+				// Check for the expected cookie and value
+				// If it is missing or doesn't match
+				// return a 404 status
+				rcookie, err := r.Cookie(cookie.Name)
+				if err != nil || rcookie.Value != cookie.Value {
+					http.Error(w, "", http.StatusNotFound)
 					return
 				}
-				cookie.Value = value
-				http.SetCookie(w, &cookie)
-			})
-		} else {
-			// Check for the expected cookie and value
-			// If it is missing or doesn't match
-			// return a 404 status
-			rcookie, err := r.Cookie(cookie.Name)
-			if err != nil || rcookie.Value != cookie.Value {
-				http.Error(w, "", http.StatusNotFound)
-				return
+				// If the cookie exits and matches
+				// this is an aadditional request.
+				// Increment the waitgroup
+				waitgroup.Add(1)
 			}
-			// If the cookie exits and matches
-			// this is an aadditional request.
-			// Increment the waitgroup
-			waitgroup.Add(1)
 		}
-		// Remove connection from the waitfroup when done
+		// Remove connection from the waitgroup when done
 		defer waitgroup.Done()
 		w.Header().Set("Content-Disposition", "attachment; filename="+
 			app.payload.Filename)
@@ -263,12 +302,36 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 		app.stopChannel <- true
 	}()
-	// Receive handler (receives file from caller)
 	go func() {
-		if err := (httpserver.Serve(tcpKeepAliveListener{listener.(*net.TCPListener)})); err != http.ErrServerClosed {
-			log.Fatalln(err)
+		netListener := tcpKeepAliveListener{listener.(*net.TCPListener)}
+		if cfg.Secure {
+			if err := httpserver.ServeTLS(netListener, cfg.TLSCert, cfg.TLSKey); err != http.ErrServerClosed {
+				log.Fatalln("error starting the server:", err)
+			}
+		} else {
+			if err := httpserver.Serve(netListener); err != http.ErrServerClosed {
+				log.Fatalln("error starting the server", err)
+			}
 		}
 	}()
 	app.instance = httpserver
 	return app, nil
+}
+
+// openBrowser navigates to a url using the default system browser
+func openBrowser(url string) {
+	var err error
+	switch runtime.GOOS {
+	case "linux":
+		err = exec.Command("xdg-open", url).Start()
+	case "windows":
+		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		err = exec.Command("open", url).Start()
+	default:
+		err = fmt.Errorf("failed to open browser on platform: %s", runtime.GOOS)
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
 }
